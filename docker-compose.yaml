@@ -1,0 +1,210 @@
+---
+version: '3.4'
+ 
+x-common:
+  &common
+  image: custom-airflow:2.6.3
+  user: "${AIRFLOW_UID}:0"
+  environment:
+    &airflow-common-env
+    # Meta-Database
+    POSTGRES_USER: airflow
+    POSTGRES_PASSWORD: airflow
+    POSTGRES_DB: airflow
+    
+    # Airflow Core
+    AIRFLOW__CORE__FERNET_KEY: " "
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: True
+    AIRFLOW__CORE__LOAD_EXAMPLES: False
+    AIRFLOW_UID: 0
+    
+    # Backend DB
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__DATABASE__LOAD_DEFAULT_CONNECTIONS: False
+    
+    # Airflow Init
+    _AIRFLOW_DB_UPGRADE: True
+    _AIRFLOW_WWW_USER_CREATE: True
+    _AIRFLOW_WWW_USER_USERNAME: airflow
+    _AIRFLOW_WWW_USER_PASSWORD: airflow
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - /var/run/docker.sock:/var/run/docker.sock
+  networks:
+    - bda-network
+  depends_on:
+    &depends-on
+    postgres:
+      condition: service_healthy
+
+ 
+services:
+  postgres:
+    image: postgres:13
+    container_name: postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes: 
+      - postgres-db-volume:/var/lib/postgresql/data
+    ports:
+      - "5434:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 5
+    networks:
+      - bda-network
+
+ 
+  scheduler:
+    <<: *common
+    container_name: airflow-scheduler
+    command: scheduler
+    restart: on-failure
+    ports:
+      - "8793:8793"
+    depends_on:
+      <<: *depends-on
+      airflow-init:
+        condition: service_completed_successfully
+  
+  webserver:
+    <<: *common
+    container_name: airflow-webserver
+    restart: always
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 30s
+      retries: 5
+    depends_on:
+      <<: *depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-init:
+    <<: *common
+    container_name: airflow-init
+    build:
+      context: .
+      dockerfile: docker_conf/airflow.Dockerfile
+    image: custom-airflow:2.6.3
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /sources/logs /sources/dags /sources/plugins
+        chown -R "${AIRFLOW_UID}:0" /sources/{logs,dags,plugins}
+        exec /entrypoint airflow version
+
+  db:
+    container_name: pg_container
+    image: postgres
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    networks:
+      - bda-network
+
+  pgadmin:
+    container_name: pgadmin4_container
+    image: dpage/pgadmin4
+    restart: always
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: root
+    ports:
+      - "5050:80"
+    networks:
+      - bda-network
+
+  spark:
+    build:
+      context: .
+      dockerfile: docker_conf/spark.Dockerfile
+    image: bda-custom-spark:3
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    ports:
+      - "9080:8080"
+      - "18080:18080"
+    command:
+      - /bin/bash
+      - -x
+      - -o
+      - pipefail
+      - -c
+      - |
+        /opt/bitnami/scripts/spark/run.sh &
+        /opt/bitnami/spark/sbin/start-history-server.sh
+        wait
+    volumes:
+      - ./configs/spark/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf
+      - ./scipts:/opt/bitnami/spark/dev/scripts
+      - application_log_path:/opt/bitnami/spark/logs
+    container_name: spark_master
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - bda-network
+
+  spark-worker:
+    image: bda-custom-spark:3
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark:7077
+      - SPARK_WORKER_MEMORY=1G
+      - SPARK_WORKER_CORES=1
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    ports:
+      - "4040-4042:4040"
+    command:
+      - /bin/bash
+      - -x
+      - -o
+      - pipefail
+      - -c
+      - |
+        /opt/bitnami/scripts/spark/run.sh &
+        sleep 10s
+        env | cat >> /home/spark_user/docker_env.txt
+        echo Spark123@ | sudo -S service ssh start
+        wait
+    volumes:
+      - ./configs/spark/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf
+      - ./scipts:/opt/bitnami/spark/dev/scripts
+      - application_log_path:/opt/bitnami/spark/logs
+    depends_on:
+      - spark
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - bda-network
+
+volumes:
+  postgres-db-volume:
+  application_log_path:
+    driver: local
+
+networks:
+  bda-network:
+    external: true
